@@ -1,0 +1,42 @@
+world:
+  height: 40
+  width: 40
+  step_time: 0.1
+  sample_time: 0.1
+  offset: [0, 0]
+  collision_mode: 'stop'
+  control_mode: 'auto' 
+
+robot:
+  - kinematics: {name: 'diff'} 
+    shape: {name: 'circle', radius: 0.2}  
+    state: [4.5, 20, 0] # x, y, theta (radians) 
+    goal: [9, 4.5, 0]   # x, y, theta (radians)
+    vel_min: [-2, -2]
+    vel_max: [2, 2]
+    goal_threshold: 0.3
+    plot:
+      show_trail: True
+      show_goal: True
+
+    sensors: 
+      - type: 'lidar2d'
+        range_min: 0
+        range_max: 5
+        angle_range: 6.2831852
+        number: 200
+        noise: False
+        alpha: 0.3
+
+obstacle:
+  - number: 10
+    distribution: {name: 'manual'}
+    state: [[20, 34], [31, 38], [10, 20], [41, 25], [20, 13], [16, 26], [10, 24], [18, 20], [16, 26], [19, 26], [10, 30]]
+    shape:
+      - {name: 'circle', radius: 1.} 
+  - number: 1
+    distribution: {name: 'manual'}
+    shape:
+      - {name: 'polygon', vertices: [[31, 24], [33, 24], [33, 28], [31, 28]]}
+    state: 
+      - [0, 0, 0] 
