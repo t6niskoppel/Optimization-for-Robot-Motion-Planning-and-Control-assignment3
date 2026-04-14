@@ -7,7 +7,7 @@ Repository associated with the course **Optimization for Robot Motion Planning a
 
 This project can also be executed in Google Colab without local setup
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Arcane-01/Optimization-for-Robot-Motion-Planning-and-Control/blob/ir_sim/colab/colab_run.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/t6niskoppel/Optimization-for-Robot-Motion-Planning-and-Control-assignment3/blob/main/colab/assignment_3_tonis_koppel.ipynb)
 
 
 ## Installation Guide
