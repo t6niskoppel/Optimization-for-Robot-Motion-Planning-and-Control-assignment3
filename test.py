@@ -60,25 +60,29 @@ def _title(planner_type, cfg):
 	return f"planner: {planner_type}   |   {params}"
 
 
-def _move_ani(world, planner_type):
+def _move_ani(world, planner_type, dst_dir=None, name=None):
 	"""Move the gif irsim just saved into animation/<world>/<planner_type>.gif.
 
 	Grouping by world (not planner) puts every planner's run for one world in the
 	same folder, so they can be compared side by side.
+
+	dst_dir/name override the destination, used to collect failing runs into a
+	single failures/ folder named <world>__<planner>.gif instead.
 	"""
 	stem = os.path.splitext(os.path.basename(world))[0]
 	src = os.path.join(_BASE, 'animation', f'animation_{stem}.gif')
 	if os.path.exists(src):
-		dst_dir = os.path.join(_BASE, 'animation', stem)
+		dst_dir = dst_dir or os.path.join(_BASE, 'animation', stem)
 		os.makedirs(dst_dir, exist_ok=True)
-		shutil.move(src, os.path.join(dst_dir, f'{planner_type}.gif'))
+		shutil.move(src, os.path.join(dst_dir, name or f'{planner_type}.gif'))
 
 
 def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
-				max_steps=300, render=True, save_ani=False):
+				max_steps=300, render=True, save_ani=False, ani_dst=None):
 	"""Run one MPC episode. Returns metrics dict.
 
 	render=False, save_ani=False disables all plotting for fast benchmarking.
+	ani_dst=(dir, name) sends a saved gif there instead of animation/<world>/.
 	"""
 	if render:
 		# display=False keeps it headless (no window pops up) while plotting stays
@@ -158,7 +162,10 @@ def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
 
 	if save_ani:
 		env.end(ending_time=3)
-		_move_ani(world, planner_type)
+		if ani_dst is not None:
+			_move_ani(world, planner_type, dst_dir=ani_dst[0], name=ani_dst[1])
+		else:
+			_move_ani(world, planner_type)
 	else:
 		env.end()
 
@@ -208,7 +215,7 @@ def barn_worlds(spec=10):
 
 
 def benchmark(worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=300,
-				save_ani=False):
+				save_ani=False, save_failures=False):
 	"""Run planners on one or more worlds and print metrics.
 
 	worlds: a single world filename (str) or a list of them. Each world is run on
@@ -219,9 +226,17 @@ def benchmark(worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=30
 	save_ani=True: also write a headless gif per (planner, world) into
 	animation/<world>/<planner>.gif -- no window pops up, but this is much slower
 	and the gifs are large, so pass a short `worlds`/`planners` list.
+
+	save_failures=True: keep the fast metrics-only sweep, but whenever an episode
+	fails (collision or timeout) re-run just that one with animation and save it to
+	failures/<world>__<planner>.gif. Runs are deterministic, so the re-run
+	reproduces the exact failure. Cheap to leave on for a full sweep -- only the
+	failures pay the rendering cost.
 	"""
 	if isinstance(worlds, str):
 		worlds = [worlds]
+
+	fail_dir = os.path.join(_BASE, 'failures')
 
 	results = []
 	for w in worlds:
@@ -254,6 +269,20 @@ def benchmark(worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=30
 				status = "timeout"
 			print(f"{pt:9s} {m['world']:18s} success={m['success']!s:5s} "
 					f"t={status:>8s} clr={m['min_clearance']:.2f}m solve={m['solve_ms']:.1f}ms")
+
+			# Failed episode: re-run deterministically with animation so the failure
+			# can be inspected. Wrapped so a render-time error can't abort the sweep.
+			if save_failures and not m['success']:
+				stem = os.path.splitext(m['world'])[0]
+				try:
+					run_episode(w, pt, max_steps=max_steps, render=True, save_ani=True,
+								ani_dst=(fail_dir, f'{stem}__{pt}.gif'))
+					print(f"           -> saved failure gif: failures/{stem}__{pt}.gif")
+				except Exception as e:
+					print(f"           -> could not save failure gif: {type(e).__name__}: {e}")
+				finally:
+					plt.close('all')
+					gc.collect()
 
 	print("\n=== Summary (per planner) ===")
 	for pt in planners:
