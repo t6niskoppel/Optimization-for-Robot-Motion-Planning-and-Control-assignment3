@@ -1,5 +1,6 @@
 import os
 import re
+import gc
 import glob
 import shutil
 import time
@@ -9,6 +10,7 @@ import matplotlib
 # irsim forces TkAgg on import; override to a headless backend so gifs save in
 # notebooks/Colab without opening a window or crashing on Tk teardown.
 matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 
 from utils import *
@@ -59,13 +61,17 @@ def _title(planner_type, cfg):
 
 
 def _move_ani(world, planner_type):
-	"""Move the gif irsim just saved into animation/<planner_type>/."""
+	"""Move the gif irsim just saved into animation/<world>/<planner_type>.gif.
+
+	Grouping by world (not planner) puts every planner's run for one world in the
+	same folder, so they can be compared side by side.
+	"""
 	stem = os.path.splitext(os.path.basename(world))[0]
 	src = os.path.join(_BASE, 'animation', f'animation_{stem}.gif')
 	if os.path.exists(src):
-		dst_dir = os.path.join(_BASE, 'animation', planner_type)
+		dst_dir = os.path.join(_BASE, 'animation', stem)
 		os.makedirs(dst_dir, exist_ok=True)
-		shutil.move(src, os.path.join(dst_dir, f'animation_{stem}.gif'))
+		shutil.move(src, os.path.join(dst_dir, f'{planner_type}.gif'))
 
 
 def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
@@ -173,32 +179,72 @@ def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
 	}
 
 
-def barn_worlds(n=10):
-	"""First n barn benchmark worlds, in numeric order.
+def barn_worlds(spec=10):
+	"""Barn benchmark world paths, in numeric order.
 
-	Plain sorted() is lexicographic on the filename, which gives barn_0, barn_1,
-	barn_10, barn_100, ... -- so "first 10" would skip barn_2..barn_9. Sort by the
-	integer in the name instead to get barn_0, barn_1, ..., barn_9, barn_10, ...
+	`spec` is either:
+	  * an int n  -> the first n worlds: barn_0, barn_1, ..., barn_{n-1}, or
+	  * an iterable of indices, e.g. range(0, 300, 10) or [3, 43, 100] -> exactly
+	    those barn_<i>.yaml files (in the order given).
+
+	Files are keyed by the integer in the name, not sorted lexicographically:
+	a plain sort gives barn_0, barn_1, barn_10, barn_100, ... so "first 10" would
+	otherwise skip barn_2..barn_9.
 	"""
-	paths = glob.glob(os.path.join(_BASE, 'barn_envs', '*.yaml'))
-	paths.sort(key=lambda p: int(re.search(r'barn_(\d+)', os.path.basename(p)).group(1)))
-	return paths[:n]
+	by_idx = {}
+	for p in glob.glob(os.path.join(_BASE, 'barn_envs', '*.yaml')):
+		i = int(re.search(r'barn_(\d+)', os.path.basename(p)).group(1))
+		by_idx[i] = p
+
+	if isinstance(spec, int):
+		indices = sorted(by_idx)[:spec]
+	else:
+		indices = list(spec)
+
+	missing = [i for i in indices if i not in by_idx]
+	if missing:
+		raise FileNotFoundError(f"no barn world(s) for index/indices {missing}")
+	return [by_idx[i] for i in indices]
 
 
 def benchmark(worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=300,
-				save_ani=True):
-	"""Run every planner on every world and print metrics.
+				save_ani=False):
+	"""Run planners on one or more worlds and print metrics.
+
+	worlds: a single world filename (str) or a list of them. Each world is run on
+	every planner before moving on to the next world, so the per-planner gifs for
+	one world land next to each other.
 
 	save_ani=False (default): no plotting, fast metrics-only run.
 	save_ani=True: also write a headless gif per (planner, world) into
-	animation/<planner>/animation_<world>.gif -- no window pops up, but this is
-	much slower and the gifs are large, so pass a short `worlds`/`planners` list.
+	animation/<world>/<planner>.gif -- no window pops up, but this is much slower
+	and the gifs are large, so pass a short `worlds`/`planners` list.
 	"""
+	if isinstance(worlds, str):
+		worlds = [worlds]
+
 	results = []
-	for pt in planners:
-		for w in worlds:
-			m = run_episode(w, pt, max_steps=max_steps,
-							render=save_ani, save_ani=save_ani)
+	for w in worlds:
+		for pt in planners:
+			# One bad world/planner shouldn't abort the whole sweep (and lose every
+			# result gathered so far). Record it as a failure and move on. The figure
+			# + env cleanup below also keeps memory flat across dozens of irsim.make
+			# calls, which is what otherwise crashes a long benchmark in Colab.
+			try:
+				m = run_episode(w, pt, max_steps=max_steps,
+								render=save_ani, save_ani=save_ani)
+			except Exception as e:
+				print(f"{pt:9s} {os.path.basename(w):18s} CRASHED: {type(e).__name__}: {e}")
+				results.append({
+					'world': os.path.basename(w), 'planner': pt,
+					'success': False, 'collided': False, 'steps': max_steps,
+					'time_to_goal': None, 'min_clearance': np.nan, 'solve_ms': np.nan,
+				})
+				continue
+			finally:
+				plt.close('all')
+				gc.collect()
+
 			results.append(m)
 			if m['success']:
 				status = f"{m['time_to_goal']:.1f}s"
@@ -216,8 +262,10 @@ def benchmark(worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=30
 		cr = 100.0 * np.mean([r['collided'] for r in rs])
 		ttg = [r['time_to_goal'] for r in rs if r['success']]
 		mean_ttg = np.mean(ttg) if ttg else float('nan')
-		mean_clr = np.mean([r['min_clearance'] for r in rs])
-		mean_solve = np.mean([r['solve_ms'] for r in rs])
+		# nanmean: a crashed episode records clr/solve as NaN; plain mean would
+		# poison the whole planner's average.
+		mean_clr = np.nanmean([r['min_clearance'] for r in rs])
+		mean_solve = np.nanmean([r['solve_ms'] for r in rs])
 		print(f"{pt:9s} success={sr:3.0f}%  collision={cr:3.0f}%  "
 				f"mean_ttg={mean_ttg:5.2f}s  mean_clr={mean_clr:5.2f}m  solve={mean_solve:5.1f}ms/step")
 	return results

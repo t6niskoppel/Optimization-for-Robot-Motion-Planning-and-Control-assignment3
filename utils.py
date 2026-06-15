@@ -1,41 +1,41 @@
 import numpy as np
-import open3d as o3d
 
 L_max_lidar = 100
 
 def scan_to_pcd(scan_data):
-	ranges = np.array(scan_data['ranges'])
+	"""LiDAR scan -> (L_max_lidar, 2) obstacle points in the robot frame.
+
+	The output length is fixed so the JAX cost function never has to recompile.
+	Pure NumPy (no Open3D): convert hits to xy, then keep the L_max_lidar *nearest*
+	points. The cost only penalises points inside safe_dist, so the nearest points
+	are exactly the safety-relevant ones -- farther points contribute zero gradient,
+	and keeping the closest also makes the min-clearance metric exact.
+	"""
+	ranges = np.asarray(scan_data['ranges'], dtype=float)
 	angles = np.linspace(scan_data['angle_min'], scan_data['angle_max'], len(ranges))
-	point_list = []
-	for i in range(len(ranges)):
-		scan_range = ranges[i]
-		angle = angles[i]
 
-		if scan_range < ( scan_data['range_max'] - 0.01):
-			point = np.array([scan_range * np.cos(angle), scan_range * np.sin(angle)])
-			point_list.append(point)
+	# keep real hits only; a max-range return means the beam saw nothing.
+	hit = ranges < (scan_data['range_max'] - 0.01)
+	r = ranges[hit]
+	a = angles[hit]
+	pts = np.stack([r * np.cos(a), r * np.sin(a)], axis=-1)  # (M, 2)
 
-	if len(point_list) == 0:
-		points_2d = np.empty((0, 2))
-	else:
-		points_2d = np.array(point_list) 
+	# nothing in view: a single far sentinel that can't be the min or violate safe_dist.
+	if pts.shape[0] == 0:
+		return np.full((L_max_lidar, 2), 1e10)
 
-	points = np.hstack([points_2d, np.zeros((points_2d.shape[0], 1))])
-	#------------------------------------------
-	## PCD Processing
-	pcd = o3d.geometry.PointCloud() # Open3D PCD
-	pcd.points = o3d.utility.Vector3dVector(points)
-	if np.asarray(pcd.points).shape[0] > L_max_lidar:
-		pcd = pcd.farthest_point_down_sample(L_max_lidar) # Downsample the PCD
-	if pcd.is_empty():
-		obs_pt = np.array([1e10, 1e10, 1e10])
-		obs_pt = np.reshape(obs_pt, (1,3))
-		pcd.points.extend(o3d.utility.Vector3dVector(obs_pt))
-	pcd_ds = np.asarray(pcd.points)
-	if pcd_ds.shape[0] < L_max_lidar:
-		pcd_ds = np.vstack([pcd_ds, np.tile(pcd_ds[-1], (L_max_lidar - pcd_ds.shape[0], 1))]) # appending the last point          
-	cloud = pcd_ds[: , :2]		
-	return np.array(cloud)
+	# more hits than the cap: keep the L_max_lidar nearest (argpartition is O(M)).
+	if pts.shape[0] > L_max_lidar:
+		nearest = np.argpartition(r, L_max_lidar)[:L_max_lidar]
+		pts = pts[nearest]
+
+	# fewer hits than the cap: pad with the last point (a real obstacle, so a
+	# duplicate doesn't change the cost) to reach the fixed length.
+	if pts.shape[0] < L_max_lidar:
+		pad = np.tile(pts[-1], (L_max_lidar - pts.shape[0], 1))
+		pts = np.vstack([pts, pad])
+
+	return pts
 
 def global_to_local(state, goal_global):
 	trans = state[0:2].flatten()

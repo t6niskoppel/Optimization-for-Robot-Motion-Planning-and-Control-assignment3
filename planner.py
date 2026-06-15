@@ -57,30 +57,51 @@ def cost_fn(u_seq, goal, pcd, dt, cfg):
 	cost_goal = cfg['w_goal_run'] * jnp.sum(sq_goal)
 	cost_term = cfg['w_term'] * sq_goal[-1]
 
-	# obstacles: each pcd point is a small circle of radius R_OBS.
-	# smooth squared-hinge so the gradient is non-zero near contact.
+	# obstacles: each pcd point is a small circle, penalty zero outside safe_dist.
+	# A pure squared hinge has gradient 2*viol, which VANISHES right at the boundary
+	# (viol->0): the optimizer feels no push until a point is already penetrating, so
+	# it cuts corners and collides. The linear term (w_edge) gives a non-vanishing
+	# outward gradient the instant a point crosses safe_dist -- a firm wall -- while
+	# the quadratic term still ramps up steeply for deeper violations.
 	diffs = pos[:, None, :] - pcd[None, :, :]      # (H+1, N, 2)
 	dists = jnp.linalg.norm(diffs, axis=-1)         # (H+1, N)
 	viol = jnp.maximum(cfg['safe_dist'] - dists, 0.0)
-	cost_obs = cfg['w_obs'] * jnp.sum(viol ** 2)
+	cost_obs = cfg['w_obs'] * jnp.sum(viol ** 2 + cfg['w_edge'] * viol)
 
 	# control effort
 	cost_ctrl = cfg['w_ctrl'] * jnp.sum(u_seq ** 2)
 
-	return cost_goal + cost_term + cost_obs + cost_ctrl
+	# terminal velocity: bring the robot to rest at the end of the horizon so it
+	# stops at the goal instead of arriving at full speed and orbiting it. This only
+	# shapes the horizon tail, so it brakes once the goal is within planning range
+	# and leaves cruising speed far from the goal untouched.
+	u_term = u_seq.reshape((H, 2))[-1]
+	cost_vterm = cfg['w_vterm'] * jnp.sum(u_term ** 2)
+
+	return cost_goal + cost_term + cost_obs + cost_ctrl + cost_vterm
 
 
 cost_batch = vmap(cost_fn, in_axes=(0, None, None, None, None))
 
 
 # --------------------------- Optimizers ---------------------------
+def _clip_grad(g, max_norm):
+	"""Scale g down so ||g|| <= max_norm. The obstacle term (w_obs) makes the
+	gradient blow up to ~1e4 when the robot sits near a wall; a single
+	un-clipped step then flings the controls far past the v/w clip bounds,
+	where jnp.clip has zero gradient and traps them at saturation -- a constant
+	w_max turn, i.e. the plan spins in a circle. Clipping keeps each step sane."""
+	norm = jnp.linalg.norm(g)
+	return g * jnp.minimum(1.0, max_norm / (norm + 1e-8))
+
+
 @partial(jit, static_argnums=(4,))
 def optimize_gd(u_init, goal, pcd, dt, cfg):
 	g = lambda u: grad(cost_fn)(u, goal, pcd, dt, cfg)
 	lr = cfg['lr']
 
 	def body(_, u):
-		return u - lr * g(u)
+		return u - lr * _clip_grad(g(u), cfg['grad_clip'])
 
 	return lax.fori_loop(0, cfg['grad_iters'], body, u_init)
 
@@ -94,7 +115,7 @@ def optimize_nesterov(u_init, goal, pcd, dt, cfg):
 
 	def body(_, carry):
 		u, vel = carry
-		grad_lookahead = g(u + mu * vel)
+		grad_lookahead = _clip_grad(g(u + mu * vel), cfg['grad_clip'])
 		vel = mu * vel - lr * grad_lookahead
 		return (u + vel, vel)
 
@@ -109,7 +130,7 @@ def optimize_adam(u_init, goal, pcd, dt, cfg):
 
 	def body(t, carry):
 		u, m, v = carry
-		gt = g(u)
+		gt = _clip_grad(g(u), cfg['grad_clip'])
 		m = b1 * m + (1 - b1) * gt
 		v = b2 * v + (1 - b2) * gt ** 2
 		mhat = m / (1 - b1 ** (t + 1))
@@ -186,16 +207,27 @@ class Planner():
 			'v_max': 2.0,
 			'w_max': 2.0,
 			# obstacles: each pcd point is a small circle of radius r_obs
-			'safe_dist': 0.1 + 0.2 + 0.1,   # r_obs + r_robot + margin
+			'safe_dist': 0.15 + 0.3 + 0.03,   # r_obs + r_robot + margin
 			# cost weights
 			'w_term': 500.0,
-			'w_goal_run': 1.0,
-			'w_obs': 5000.0,
+			'w_goal_run': 500.0,
+			'w_obs': 5e6,
+			# linear-hinge scale (metres): the obstacle gradient at the safe_dist
+			# boundary is w_obs * w_edge. Larger -> firmer wall, fewer corner-clips,
+			# but tight gaps may get blocked (raise toward a hard constraint).
+			# Set to 0.0 to recover the old pure-squared-hinge behaviour.
+			'w_edge': 0.3,
 			'w_ctrl': 0.01,
+			# terminal-velocity penalty: brings the plan to rest at the goal so the
+			# robot stops instead of orbiting. Larger -> brakes harder/earlier.
+			'w_vterm': 10.0,
 			# gradient descent / nesterov
-			'grad_iters': 60,
+			'grad_iters': 80,
 			'lr': 0.005,
 			'momentum': 0.9,
+			# cap the gradient norm so a huge obstacle-cost gradient can't push
+			# the controls past the v/w clip into a saturated (circling) plan.
+			'grad_clip': 100.0,
 			# adam (used by hybrid refinement)
 			'adam_iters': 30,
 			'b1': 0.9,
@@ -204,10 +236,10 @@ class Planner():
 			# CEM
 			'B': 200,
 			'num_elite': 20,
-			'cem_iters': 10,
+			'cem_iters': 15,
 			'sigma_init': 1.0,
 			'sigma_min': 0.05,
-			'alpha': 0.05,
+			'alpha': 0.1,
 		}
 		if cfg is not None:
 			self.cfg.update(cfg)
@@ -215,9 +247,14 @@ class Planner():
 		# frozen tuple makes cfg hashable -> usable as a static jit arg
 		self._cfg_static = _FrozenCfg(self.cfg)
 
-		# warm start: small forward velocity bias
+		# warm start: small forward velocity bias + tiny asymmetric noise.
+		# The noise breaks the left/right symmetry that otherwise deadlocks plain
+		# gradient descent when an obstacle sits straight ahead: the left and right
+		# obstacle gradients cancel and GD drives straight through. A fixed key
+		# keeps it deterministic so benchmark numbers are reproducible.
 		u0 = jnp.zeros((H, 2))
 		u0 = u0.at[:, 0].set(0.5)
+		u0 = u0 + 0.01 * normal(PRNGKey(42), (H, 2))
 		self.u_seq = u0.reshape(-1)
 
 	def compute_controls(self, initial_velocity, goal_local, pcd):

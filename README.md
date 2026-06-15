@@ -29,15 +29,7 @@ pip install ir-sim[all]
 
 ---
 
-### 3. Install Open3D
-
-```bash
-pip install open3d
-```
-
----
-
-### 4. Install JAX (Match Your CUDA Version)
+### 3. Install JAX (Match Your CUDA Version)
 
 Install JAX depending on your system configuration.
 
