@@ -56,7 +56,7 @@ def _title(planner_type, cfg):
 	elif planner_type == "cem":
 		params = f"H={H}, B={cfg['B']}, elite={cfg['num_elite']}, iters={cfg['cem_iters']}"
 	else:  # hybrid
-		params = f"H={H}, B={cfg['B']}, cem={cfg['cem_iters']}, adam={cfg['adam_iters']}"
+		params = f"H={H}, B={cfg['B']}, cem={cfg['hybrid_cem_iters']}, adam={cfg['adam_iters']}"
 	return f"planner: {planner_type}   |   {params}"
 
 

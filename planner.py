@@ -145,9 +145,13 @@ def optimize_adam(u_init, goal, pcd, dt, cfg):
 	return u
 
 
-@partial(jit, static_argnums=(5,))
-def cem_loop(mean_init, goal, pcd, dt, key, cfg):
-	"""Weighted-CEM. Returns the optimized mean control sequence."""
+@partial(jit, static_argnums=(5, 6))
+def cem_loop(mean_init, goal, pcd, dt, key, cfg, n_iters):
+	"""Weighted-CEM. Returns the optimized mean control sequence.
+
+	n_iters is separate from cfg so pure CEM and hybrid can run different counts:
+	hybrid only needs CEM to land in the right basin, then Adam refines.
+	"""
 	dim = 2 * H
 	B, n_elite = cfg['B'], cfg['num_elite']
 	alpha = cfg['alpha']
@@ -173,18 +177,18 @@ def cem_loop(mean_init, goal, pcd, dt, key, cfg):
 		return (mean, sigma, key)
 
 	sigma_init = jnp.ones(dim) * cfg['sigma_init']
-	mean, _, _ = lax.fori_loop(0, cfg['cem_iters'], body, (mean_init, sigma_init, key))
+	mean, _, _ = lax.fori_loop(0, n_iters, body, (mean_init, sigma_init, key))
 	return mean
 
 
 @partial(jit, static_argnums=(5,))
 def optimize_cem(u_init, goal, pcd, dt, key, cfg):
-	return cem_loop(u_init, goal, pcd, dt, key, cfg)
+	return cem_loop(u_init, goal, pcd, dt, key, cfg, cfg['cem_iters'])
 
 
 @partial(jit, static_argnums=(5,))
 def optimize_hybrid(u_init, goal, pcd, dt, key, cfg):
-	mean = cem_loop(u_init, goal, pcd, dt, key, cfg)
+	mean = cem_loop(u_init, goal, pcd, dt, key, cfg, cfg['hybrid_cem_iters'])
 	return optimize_adam(mean, goal, pcd, dt, cfg)
 
 
@@ -236,7 +240,10 @@ class Planner():
 			# CEM
 			'B': 200,
 			'num_elite': 20,
-			'cem_iters': 15,
+			'cem_iters': 20,
+			# hybrid runs CEM only to find the basin, then Adam refines, so it needs
+			# far fewer CEM iters than pure CEM (which relies on CEM alone).
+			'hybrid_cem_iters': 8,
 			'sigma_init': 1.0,
 			'sigma_min': 0.05,
 			'alpha': 0.1,
