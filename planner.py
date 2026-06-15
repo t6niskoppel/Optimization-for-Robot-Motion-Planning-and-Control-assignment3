@@ -47,6 +47,28 @@ rollout_batch = jit(vmap(rollout, in_axes=(0, None, None, None, None)))
 
 
 # ------------------------------ Cost ------------------------------
+def obstacle_cost(pos, pcd, cfg):
+	"""Obstacle penalty for a (H+1, 2) position trajectory.
+
+	Smooth decaying repulsion: each pcd point pushes the trajectory away with a
+	force that is strong at safe_dist and fades to zero over an influence band
+	beyond it (d_influence). Unlike a hard hinge -- which is exactly zero past
+	safe_dist and so gives the plan no reason to keep clearance once outside it --
+	this gradient never vanishes inside the band, so the plan holds a standoff where
+	there is room. It still yields in a tight gap: the repulsion is finite and the
+	two walls balance, so the robot centres and passes instead of being blocked.
+	Shifted to reach zero exactly at d_influence so the penalty stays continuous.
+
+	Split out from cost_fn so its gradient w.r.t. position can be drawn on the
+	animation as the repulsive force the plan feels (see obstacle_force).
+	"""
+	diffs = pos[:, None, :] - pcd[None, :, :]      # (H+1, N, 2)
+	dists = jnp.linalg.norm(diffs, axis=-1)         # (H+1, N)
+	shift = jnp.exp(-cfg['d_influence'] / cfg['rep_scale'])   # repulsion at band edge
+	rep = jnp.exp(-(dists - cfg['safe_dist']) / cfg['rep_scale']) - shift
+	return cfg['w_obs'] * jnp.sum(jnp.maximum(rep, 0.0))
+
+
 def cost_fn(u_seq, goal, pcd, dt, cfg):
 	"""Total trajectory cost. Differentiable so jax.grad works."""
 	pos = rollout(u_seq, dt, cfg['v_min'], cfg['v_max'], cfg['w_max'])  # (H+1, 2)
@@ -57,16 +79,7 @@ def cost_fn(u_seq, goal, pcd, dt, cfg):
 	cost_goal = cfg['w_goal_run'] * jnp.sum(sq_goal)
 	cost_term = cfg['w_term'] * sq_goal[-1]
 
-	# obstacles: each pcd point is a small circle, penalty zero outside safe_dist.
-	# A pure squared hinge has gradient 2*viol, which VANISHES right at the boundary
-	# (viol->0): the optimizer feels no push until a point is already penetrating, so
-	# it cuts corners and collides. The linear term (w_edge) gives a non-vanishing
-	# outward gradient the instant a point crosses safe_dist -- a firm wall -- while
-	# the quadratic term still ramps up steeply for deeper violations.
-	diffs = pos[:, None, :] - pcd[None, :, :]      # (H+1, N, 2)
-	dists = jnp.linalg.norm(diffs, axis=-1)         # (H+1, N)
-	viol = jnp.maximum(cfg['safe_dist'] - dists, 0.0)
-	cost_obs = cfg['w_obs'] * jnp.sum(viol ** 2 + cfg['w_edge'] * viol)
+	cost_obs = obstacle_cost(pos, pcd, cfg)
 
 	# control effort
 	cost_ctrl = cfg['w_ctrl'] * jnp.sum(u_seq ** 2)
@@ -82,6 +95,18 @@ def cost_fn(u_seq, goal, pcd, dt, cfg):
 
 
 cost_batch = vmap(cost_fn, in_axes=(0, None, None, None, None))
+
+
+@partial(jit, static_argnums=(2,))
+def obstacle_force(pos, pcd, cfg):
+	"""Per-point repulsive force = -d(obstacle cost)/d(pos), shape (H+1, 2).
+
+	This is exactly the obstacle gradient that pushes the planned trajectory away
+	from lidar points. Drawn on the animation it shows where -- and how firmly --
+	each waypoint is being pushed off obstacles, so a corner the plan clips shows up
+	as a point with little or no outward arrow.
+	"""
+	return -grad(obstacle_cost)(pos, pcd, cfg)
 
 
 # --------------------------- Optimizers ---------------------------
@@ -216,11 +241,12 @@ class Planner():
 			'w_term': 500.0,
 			'w_goal_run': 500.0,
 			'w_obs': 5e6,
-			# linear-hinge scale (metres): the obstacle gradient at the safe_dist
-			# boundary is w_obs * w_edge. Larger -> firmer wall, fewer corner-clips,
-			# but tight gaps may get blocked (raise toward a hard constraint).
-			# Set to 0.0 to recover the old pure-squared-hinge behaviour.
-			'w_edge': 0.3,
+			# smooth-repulsion shape (metres). rep_scale: decay length of the push --
+			# smaller = sharper wall. d_influence: how far beyond safe_dist the push
+			# still reaches, i.e. the standoff the plan tries to hold in open space.
+			# Larger d_influence keeps more clearance but tight gaps may get blocked.
+			'rep_scale': 0.08,
+			'd_influence': 0.10,
 			'w_ctrl': 0.01,
 			# terminal-velocity penalty: brings the plan to rest at the goal so the
 			# robot stops instead of orbiting. Larger -> brakes harder/earlier.
@@ -231,7 +257,10 @@ class Planner():
 			'momentum': 0.9,
 			# cap the gradient norm so a huge obstacle-cost gradient can't push
 			# the controls past the v/w clip into a saturated (circling) plan.
-			'grad_clip': 100.0,
+			# 250 (up from 100) lets more of the firm repulsion gradient at safe_dist
+			# through, so the plan is pushed harder off obstacles and clips fewer
+			# corners. Going higher (500) overshoots and starts to destabilise gd.
+			'grad_clip': 250.0,
 			# adam (used by hybrid refinement)
 			'adam_iters': 30,
 			'b1': 0.9,
@@ -296,6 +325,16 @@ class Planner():
 		v = jnp.array([[v0], [w0]])
 
 		return v, np.array(local_traj)  # (2,1), (H+1, 2)
+
+	def obstacle_force(self, traj_local, pcd):
+		"""Repulsive obstacle force at each point of a (H+1, 2) local trajectory.
+
+		Returns a NumPy (H+1, 2) array in the robot frame, for drawing the obstacle
+		gradient on the animation.
+		"""
+		pos = jnp.asarray(traj_local, dtype=jnp.float32)
+		pcd = jnp.asarray(pcd, dtype=jnp.float32)
+		return np.array(obstacle_force(pos, pcd, self._cfg_static))
 
 
 class _FrozenCfg(dict):

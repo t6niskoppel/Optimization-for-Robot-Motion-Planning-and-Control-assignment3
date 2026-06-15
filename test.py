@@ -71,10 +71,13 @@ def _move_ani(world, planner_type, dst_dir=None, name=None):
 	"""
 	stem = os.path.splitext(os.path.basename(world))[0]
 	src = os.path.join(_BASE, 'animation', f'animation_{stem}.gif')
-	if os.path.exists(src):
-		dst_dir = dst_dir or os.path.join(_BASE, 'animation', stem)
-		os.makedirs(dst_dir, exist_ok=True)
-		shutil.move(src, os.path.join(dst_dir, name or f'{planner_type}.gif'))
+	if not os.path.exists(src):
+		return None
+	dst_dir = dst_dir or os.path.join(_BASE, 'animation', stem)
+	os.makedirs(dst_dir, exist_ok=True)
+	dst = os.path.join(dst_dir, name or f'{planner_type}.gif')
+	shutil.move(src, dst)
+	return dst
 
 
 def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
@@ -92,6 +95,7 @@ def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
 		_hide_obstacle_arrows(env)
 		ax = env._env_plot.ax
 		traj_line = None
+		quiver_artist = None
 	else:
 		env = irsim.make(world, save_ani=save_ani, display=False, disable_all_plot=True)
 		_fix_paths(env)
@@ -145,6 +149,28 @@ def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
 			if traj_line is not None:
 				traj_line.remove()
 			traj_line, = ax.plot(traj_global[:, 0], traj_global[:, 1], 'b-')
+
+			# obstacle-cost gradient (repulsive force) at each trajectory point, so the
+			# gif shows where the plan is being pushed off obstacles -- and where it
+			# isn't, which is where it clips corners. The force is in the robot frame;
+			# rotate it by yaw into world coords (a direction, so no translation).
+			force_local = planner.obstacle_force(optimal_traj, pcd)
+			yaw = robot_state[2]
+			R = np.array([[np.cos(yaw), -np.sin(yaw)],
+						  [np.sin(yaw),  np.cos(yaw)]])
+			force_global = (R @ force_local.T).T
+			if quiver_artist is not None:
+				quiver_artist.remove()
+				quiver_artist = None
+			mmax = float(np.linalg.norm(force_global, axis=1).max())
+			if mmax > 1e-6:
+				# scale so the strongest arrow this frame is ~0.6 m: magnitudes span
+				# orders of magnitude, so arrows are relative within each frame.
+				quiver_artist = ax.quiver(
+					traj_global[:, 0], traj_global[:, 1],
+					force_global[:, 0], force_global[:, 1],
+					color='lime', angles='xy', scale_units='xy',
+					scale=mmax / 0.6, width=0.004, zorder=5)
 
 		env.step(velocity)
 		if render:
@@ -274,10 +300,14 @@ def benchmark(worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=30
 			# can be inspected. Wrapped so a render-time error can't abort the sweep.
 			if save_failures and not m['success']:
 				stem = os.path.splitext(m['world'])[0]
+				dst = os.path.join(fail_dir, f'{stem}__{pt}.gif')
 				try:
 					run_episode(w, pt, max_steps=max_steps, render=True, save_ani=True,
 								ani_dst=(fail_dir, f'{stem}__{pt}.gif'))
-					print(f"           -> saved failure gif: failures/{stem}__{pt}.gif")
+					if os.path.exists(dst):
+						print(f"           -> saved failure gif: failures/{stem}__{pt}.gif")
+					else:
+						print(f"           -> WARNING: no gif produced for {stem}/{pt}")
 				except Exception as e:
 					print(f"           -> could not save failure gif: {type(e).__name__}: {e}")
 				finally:
