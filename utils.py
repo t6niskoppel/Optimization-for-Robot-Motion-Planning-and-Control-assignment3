@@ -1,15 +1,16 @@
 import numpy as np
 
-L_max_lidar = 100
+L_max_lidar = 100  # = lidar beam count, so every hit is kept (no nearest-cap downsample)
 
 def scan_to_pcd(scan_data):
 	"""LiDAR scan -> (L_max_lidar, 2) obstacle points in the robot frame.
 
 	The output length is fixed so the JAX cost function never has to recompile.
-	Pure NumPy (no Open3D): convert hits to xy, then keep the L_max_lidar *nearest*
-	points. The cost only penalises points inside safe_dist, so the nearest points
-	are exactly the safety-relevant ones -- farther points contribute zero gradient,
-	and keeping the closest also makes the min-clearance metric exact.
+	Pure NumPy (no Open3D): convert hits to xy. L_max_lidar matches the lidar's beam
+	count, so in this world every hit is kept -- no downsampling, no wall dropped.
+	The nearest-cap branch below only triggers if a future lidar has MORE beams than
+	the buffer, in which case it keeps the nearest (safety-relevant) points. The
+	soft-min cost is density-robust, so keeping all points doesn't bias it.
 	"""
 	ranges = np.asarray(scan_data['ranges'], dtype=float)
 	angles = np.linspace(scan_data['angle_min'], scan_data['angle_max'], len(ranges))
@@ -29,10 +30,12 @@ def scan_to_pcd(scan_data):
 		nearest = np.argpartition(r, L_max_lidar)[:L_max_lidar]
 		pts = pts[nearest]
 
-	# fewer hits than the cap: pad with the last point (a real obstacle, so a
-	# duplicate doesn't change the cost) to reach the fixed length.
+	# fewer hits than the cap: pad with a far sentinel (not a duplicate of a real
+	# point) to reach the fixed length. The cost aggregates points with a soft-min,
+	# where duplicating a near point would bias the estimate toward it; a 1e10
+	# sentinel is ignored by both the soft-min and the min-clearance metric.
 	if pts.shape[0] < L_max_lidar:
-		pad = np.tile(pts[-1], (L_max_lidar - pts.shape[0], 1))
+		pad = np.full((L_max_lidar - pts.shape[0], 2), 1e10)
 		pts = np.vstack([pts, pad])
 
 	return pts

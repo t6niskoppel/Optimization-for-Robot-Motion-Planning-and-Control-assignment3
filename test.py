@@ -342,28 +342,33 @@ def benchmark(worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=30
 
 
 def _cfg_label(cfg):
-	"""Short, stable label for a sweep config dict, e.g. H50_rep0.08_dinf0.1_gc250."""
+	"""Short, stable label for a sweep config dict, e.g. H50_rep_scale0.08_w_far200."""
 	parts = [f"H{cfg.get('horizon', _planner.H)}"]
-	if 'rep_scale' in cfg:    parts.append(f"rep{cfg['rep_scale']}")
-	if 'd_influence' in cfg:  parts.append(f"dinf{cfg['d_influence']}")
-	if 'grad_clip' in cfg:    parts.append(f"gc{cfg['grad_clip']}")
+	for k in sorted(cfg):
+		if k != 'horizon':
+			parts.append(f"{k}{cfg[k]}")
 	return "_".join(parts)
 
 
-def sweep(configs, worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=250):
-	"""Cross-eval a list of configs over worlds x planners (metrics only, no gifs).
+def sweep(configs, worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=250,
+			save_ani=False):
+	"""Cross-eval a list of configs over worlds x planners.
 
 	Each config is a dict that may contain 'horizon' (sets the planning horizon H)
-	plus any planner cfg key to override (e.g. rep_scale, d_influence, grad_clip):
+	plus any planner cfg key to override (e.g. rep_scale, grad_clip, lr):
 		configs = [
-			{'horizon': 30, 'rep_scale': 0.08, 'd_influence': 0.10, 'grad_clip': 250},
-			{'horizon': 50, 'rep_scale': 0.08, 'd_influence': 0.10, 'grad_clip': 250},
+			{'horizon': 30, 'lr': 0.005, 'grad_clip': 250},
+			{'horizon': 30, 'lr': 0.01,  'grad_clip': 1000},
 		]
 	Returns a flat list of result rows (one per config x world x planner), each with
 	an added 'config' label and 'horizon', ready for a DataFrame. Crash-resilient:
 	an episode that throws is recorded as a failure so one bad case can't abort the
 	long sweep. Group worlds outer so each config's first episode pays the JAX
 	recompile once, not repeatedly.
+
+	save_ani=True also writes one gif per (config, world, planner) into
+	sweep_anim/<world>__<planner>__<config>.gif -- much slower (it renders every
+	frame), so use a small configs/worlds/planners selection.
 	"""
 	if isinstance(worlds, str):
 		worlds = [worlds]
@@ -374,9 +379,13 @@ def sweep(configs, worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_ste
 		label = _cfg_label(cfg)
 		for w in worlds:
 			for pt in planners:
+				stem = os.path.splitext(os.path.basename(w))[0]
+				ani_dst = (os.path.join(_BASE, 'sweep_anim'),
+							f'{stem}__{pt}__{label}.gif') if save_ani else None
 				try:
-					m = run_episode(w, pt, max_steps=max_steps, render=False,
-									save_ani=False, cfg_override=over, horizon=horizon)
+					m = run_episode(w, pt, max_steps=max_steps, render=save_ani,
+									save_ani=save_ani, ani_dst=ani_dst,
+									cfg_override=over, horizon=horizon)
 				except Exception as e:
 					print(f"{label} {pt:9s} {os.path.basename(w):16s} CRASHED: "
 							f"{type(e).__name__}: {e}")

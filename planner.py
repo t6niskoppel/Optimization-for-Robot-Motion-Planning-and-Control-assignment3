@@ -3,7 +3,7 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import jit, vmap, lax, grad
+from jax import jit, vmap, lax, grad, nn
 from jax.random import PRNGKey, split, normal
 from functools import partial
 
@@ -20,9 +20,14 @@ def one_step(state, u, dt, v_min, v_max, w_max):
 	x, y, theta = state
 	v = jnp.clip(u[0], v_min, v_max)
 	w = jnp.clip(u[1], -w_max, w_max)
+	# Match irsim's forward-Euler integration: move along the CURRENT heading, then
+	# rotate. Verified against the simulator -- a v=1, w=1, dt=0.1 step moves by
+	# v*cos(theta), not v*cos(theta + w*dt). Advancing theta first (as before) made
+	# the planner's model disagree with the plant, so plans were systematically off
+	# on hard turns.
+	x_next = x + v * jnp.cos(theta) * dt
+	y_next = y + v * jnp.sin(theta) * dt
 	theta_next = theta + w * dt
-	x_next = x + v * jnp.cos(theta_next) * dt
-	y_next = y + v * jnp.sin(theta_next) * dt
 	return x_next, y_next, theta_next
 
 
@@ -50,23 +55,36 @@ rollout_batch = jit(vmap(rollout, in_axes=(0, None, None, None, None)))
 def obstacle_cost(pos, pcd, cfg):
 	"""Obstacle penalty for a (H+1, 2) position trajectory.
 
-	Smooth decaying repulsion: each pcd point pushes the trajectory away with a
-	force that is strong at safe_dist and fades to zero over an influence band
-	beyond it (d_influence). Unlike a hard hinge -- which is exactly zero past
-	safe_dist and so gives the plan no reason to keep clearance once outside it --
-	this gradient never vanishes inside the band, so the plan holds a standoff where
-	there is room. It still yields in a tight gap: the repulsion is finite and the
-	two walls balance, so the robot centres and passes instead of being blocked.
-	Shifted to reach zero exactly at d_influence so the penalty stays continuous.
+	Two-term repulsion on a density-robust nearest-obstacle distance:
+
+	  * Soft-min aggregation. The per-waypoint penalty is driven by a softmax-
+	    weighted average of the lidar-point distances (weights ~ exp(-dist/tau)) --
+	    a smooth, count-invariant approximation of the distance to the *nearest*
+	    obstacle -- instead of a sum over points. A sum is weighted by how many
+	    points land on each side, so a densely sampled wall out-votes a sparse one
+	    and the net force shoves the robot into the opposite obstacle. The weighted
+	    average returns exactly d for N identical points (no log(N) bias), so a dense
+	    wall and a sparse one at the same range push equally and the robot centres.
+	    lse_tau is the blend width in metres (smaller -> closer to the true nearest).
+
+	  * Hard wall (w_obs, rep_scale): a steep exp penalty INSIDE the unsafe zone
+	    (d_near < safe_dist) that blows up near contact -- collision avoidance.
+
+	  * Gentle far field (w_far, d_far): a small linear penalty reaching d_far
+	    BEYOND the safe edge, so the plan keeps extra clearance where there is room
+	    but yields in a tight gap. Small w_far keeps it gentle relative to the wall.
 
 	Split out from cost_fn so its gradient w.r.t. position can be drawn on the
 	animation as the repulsive force the plan feels (see obstacle_force).
 	"""
 	diffs = pos[:, None, :] - pcd[None, :, :]      # (H+1, N, 2)
 	dists = jnp.linalg.norm(diffs, axis=-1)         # (H+1, N)
-	shift = jnp.exp(-cfg['d_influence'] / cfg['rep_scale'])   # repulsion at band edge
-	rep = jnp.exp(-(dists - cfg['safe_dist']) / cfg['rep_scale']) - shift
-	return cfg['w_obs'] * jnp.sum(jnp.maximum(rep, 0.0))
+	w_near = nn.softmax(-dists / cfg['lse_tau'], axis=1)   # (H+1, N) density-robust weights
+	d_near = jnp.sum(w_near * dists, axis=1)              # (H+1,) ~ nearest obstacle distance
+	pen = cfg['safe_dist'] - d_near                                   # >0 inside the unsafe zone
+	wall = jnp.maximum(jnp.exp(jnp.maximum(pen, 0.0) / cfg['rep_scale']) - 1.0, 0.0)
+	far = jnp.maximum(cfg['safe_dist'] + cfg['d_far'] - d_near, 0.0)
+	return jnp.sum(cfg['w_obs'] * wall + cfg['w_far'] * far)
 
 
 def cost_fn(u_seq, goal, pcd, dt, cfg):
@@ -236,24 +254,38 @@ class Planner():
 			'v_max': 2.0,
 			'w_max': 2.0,
 			# obstacles: each pcd point is a small circle of radius r_obs
-			'safe_dist': 0.15 + 0.3 + 0.03,   # r_obs + r_robot + margin
+			'safe_dist': 0.0 + 0.3 + 0.05,   # r_obs + r_robot + margin
 			# cost weights
 			'w_term': 500.0,
 			'w_goal_run': 500.0,
-			'w_obs': 5e6,
-			# smooth-repulsion shape (metres). rep_scale: decay length of the push --
-			# smaller = sharper wall. d_influence: how far beyond safe_dist the push
-			# still reaches, i.e. the standoff the plan tries to hold in open space.
-			# Larger d_influence keeps more clearance but tight gaps may get blocked.
-			'rep_scale': 0.08,
-			'd_influence': 0.10,
-			'w_ctrl': 0.01,
+			# obstacle cost shape (see obstacle_cost):
+			# w_obs/rep_scale = the hard wall inside the unsafe zone. rep_scale is its
+			#   exp decay length (m) -- smaller = steeper wall.
+			# w_far/d_far = the gentle far field reaching d_far (m) beyond safe_dist;
+			#   small w_far keeps extra clearance in the open but yields in tight gaps.
+			# lse_tau = soft-min blend width (m): smaller -> closer to the true nearest
+			#   obstacle (more density-robust), larger -> smoother but blends sides.
+			# values below are the mean of the configs that passed the barn_43
+			# full-factorial grid (gd+nesterov): the centroid of what worked.
+			'w_obs': 1e5,
+			'rep_scale': 0.13,
+			'w_far': 100.0,
+			'd_far': 0.20,
+			'lse_tau': 0.1,
+			'w_ctrl': 0.02,
 			# terminal-velocity penalty: brings the plan to rest at the goal so the
 			# robot stops instead of orbiting. Larger -> brakes harder/earlier.
 			'w_vterm': 10.0,
 			# gradient descent / nesterov
-			'grad_iters': 80,
+			'grad_iters': 120,
+			# lr is planner-specific (grid-tuned on barn_43): gd's winners cluster at
+			# 0.005, nesterov's at 0.02 (its momentum needs a bigger base step), with
+			# zero overlap. __init__ picks lr_gd/lr_nesterov by planner_type below
+			# unless an explicit 'lr' override is passed (e.g. the sweep). 'lr' itself
+			# is the step size adam (hybrid) uses.
 			'lr': 0.005,
+			'lr_gd': 0.005,
+			'lr_nesterov': 0.02,
 			'momentum': 0.9,
 			# cap the gradient norm so a huge obstacle-cost gradient can't push
 			# the controls past the v/w clip into a saturated (circling) plan.
@@ -267,8 +299,8 @@ class Planner():
 			'b2': 0.999,
 			'eps': 1e-8,
 			# CEM
-			'B': 200,
-			'num_elite': 20,
+			'B': 300,
+			'num_elite': 15,
 			'cem_iters': 20,
 			# hybrid runs CEM only to find the basin, then Adam refines, so it needs
 			# far fewer CEM iters than pure CEM (which relies on CEM alone).
@@ -279,6 +311,15 @@ class Planner():
 		}
 		if cfg is not None:
 			self.cfg.update(cfg)
+
+		# lr is planner-specific: gd and nesterov want different step sizes (grid-
+		# tuned). Pick the matching one unless the caller passed an explicit 'lr'
+		# (e.g. the hyperparameter sweep), which must win.
+		if not (cfg and 'lr' in cfg):
+			if planner_type == 'gd':
+				self.cfg['lr'] = self.cfg['lr_gd']
+			elif planner_type == 'nesterov':
+				self.cfg['lr'] = self.cfg['lr_nesterov']
 
 		# frozen tuple makes cfg hashable -> usable as a static jit arg
 		self._cfg_static = _FrozenCfg(self.cfg)
