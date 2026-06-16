@@ -15,6 +15,7 @@ import numpy as np
 
 from utils import *
 from planner import *
+import planner as _planner  # for the horizon sweep, which sets planner.H
 
 # Anchor irsim's output paths to this file's directory. In a notebook/Colab
 # irsim defaults them to sys.path[0] (= "") which resolves to "/animation_buffer"
@@ -81,12 +82,20 @@ def _move_ani(world, planner_type, dst_dir=None, name=None):
 
 
 def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
-				max_steps=300, render=True, save_ani=False, ani_dst=None):
+				max_steps=300, render=True, save_ani=False, ani_dst=None,
+				cfg_override=None, horizon=None):
 	"""Run one MPC episode. Returns metrics dict.
 
 	render=False, save_ani=False disables all plotting for fast benchmarking.
 	ani_dst=(dir, name) sends a saved gif there instead of animation/<world>/.
+	cfg_override: dict merged into the planner config (e.g. {'rep_scale': 0.06}),
+	used by the hyperparameter sweep.
+	horizon: if set, overrides the planning horizon H for this episode. H is a
+	module global that sets array shapes, so this sets planner.H before building the
+	planner; changing it forces a JAX retrace (the control-vector shape changes).
 	"""
+	if horizon is not None:
+		_planner.H = horizon
 	if render:
 		# display=False keeps it headless (no window pops up) while plotting stays
 		# on, so frames are still captured when save_ani=True.
@@ -111,6 +120,8 @@ def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
 		'w_max': float(max(abs(vel_min[1]), abs(vel_max[1]))),
 		'safe_dist': robot_radius + 0.1 + 0.1,  # r_robot + pcd point radius + margin
 	}
+	if cfg_override:
+		env_cfg.update(cfg_override)
 	planner = Planner(env.step_time, planner_type=planner_type, cfg=env_cfg)
 	vel_init = np.zeros(2)
 
@@ -328,6 +339,61 @@ def benchmark(worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=30
 		print(f"{pt:9s} success={sr:3.0f}%  collision={cr:3.0f}%  "
 				f"mean_ttg={mean_ttg:5.2f}s  mean_clr={mean_clr:5.2f}m  solve={mean_solve:5.1f}ms/step")
 	return results
+
+
+def _cfg_label(cfg):
+	"""Short, stable label for a sweep config dict, e.g. H50_rep0.08_dinf0.1_gc250."""
+	parts = [f"H{cfg.get('horizon', _planner.H)}"]
+	if 'rep_scale' in cfg:    parts.append(f"rep{cfg['rep_scale']}")
+	if 'd_influence' in cfg:  parts.append(f"dinf{cfg['d_influence']}")
+	if 'grad_clip' in cfg:    parts.append(f"gc{cfg['grad_clip']}")
+	return "_".join(parts)
+
+
+def sweep(configs, worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=250):
+	"""Cross-eval a list of configs over worlds x planners (metrics only, no gifs).
+
+	Each config is a dict that may contain 'horizon' (sets the planning horizon H)
+	plus any planner cfg key to override (e.g. rep_scale, d_influence, grad_clip):
+		configs = [
+			{'horizon': 30, 'rep_scale': 0.08, 'd_influence': 0.10, 'grad_clip': 250},
+			{'horizon': 50, 'rep_scale': 0.08, 'd_influence': 0.10, 'grad_clip': 250},
+		]
+	Returns a flat list of result rows (one per config x world x planner), each with
+	an added 'config' label and 'horizon', ready for a DataFrame. Crash-resilient:
+	an episode that throws is recorded as a failure so one bad case can't abort the
+	long sweep. Group worlds outer so each config's first episode pays the JAX
+	recompile once, not repeatedly.
+	"""
+	if isinstance(worlds, str):
+		worlds = [worlds]
+	rows = []
+	for cfg in configs:
+		horizon = cfg.get('horizon')
+		over = {k: v for k, v in cfg.items() if k != 'horizon'}
+		label = _cfg_label(cfg)
+		for w in worlds:
+			for pt in planners:
+				try:
+					m = run_episode(w, pt, max_steps=max_steps, render=False,
+									save_ani=False, cfg_override=over, horizon=horizon)
+				except Exception as e:
+					print(f"{label} {pt:9s} {os.path.basename(w):16s} CRASHED: "
+							f"{type(e).__name__}: {e}")
+					m = {'world': os.path.basename(w), 'planner': pt, 'success': False,
+							'collided': False, 'steps': max_steps, 'time_to_goal': None,
+							'min_clearance': np.nan, 'solve_ms': np.nan}
+				finally:
+					plt.close('all')
+					gc.collect()
+				m['config'] = label
+				m['horizon'] = horizon if horizon is not None else _planner.H
+				rows.append(m)
+		# per-config success snapshot so progress is visible during a long run
+		done = [r for r in rows if r['config'] == label]
+		sr = 100.0 * np.mean([r['success'] for r in done])
+		print(f"=== {label}: overall success {sr:.0f}% over {len(worlds)} worlds x {len(planners)} planners ===")
+	return rows
 
 
 if __name__ == '__main__':
