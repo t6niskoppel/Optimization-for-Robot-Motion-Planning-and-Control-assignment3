@@ -13,6 +13,23 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+# irsim builds a pynput keyboard listener on every make(); pynput opens two X11
+# display connections per listener, and across a long benchmark they aren't
+# released fast enough -- after ~100 episodes the X server hits "Maximum number of
+# clients reached" and the run freezes. We never use keyboard control (control_mode
+# stays 'auto'), so replace the listener class with a no-op: nothing is created, so
+# nothing leaks. The stub has no 'listener'/'_mpl_*' attrs, so env.end()'s teardown
+# is a no-op too.
+import irsim.env.env_base as _env_base
+
+
+class _NoKeyboardControl:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+_env_base.KeyboardControl = _NoKeyboardControl
+
 from utils import *
 from planner import *
 import planner as _planner  # for the horizon sweep, which sets planner.H

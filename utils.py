@@ -2,6 +2,13 @@ import numpy as np
 
 L_max_lidar = 100  # = lidar beam count, so every hit is kept (no nearest-cap downsample)
 
+# "no obstacle" placeholder distance for padding / empty scans. Far beyond the ~5 m
+# lidar range, so the soft-min and min-clearance metric ignore it -- but NOT the old
+# 1e10, whose soft-min logit (-dist/lse_tau ~ -1e11) overflows XLA's fused softmax to
+# NaN on the CPU backend (the GPU backend tolerated it). 1e3 -> logit ~ -1e4, which
+# underflows to 0 cleanly, so the planner is NaN-safe on CPU and GPU alike.
+FAR_SENTINEL = 1e3
+
 def scan_to_pcd(scan_data):
 	"""LiDAR scan -> (L_max_lidar, 2) obstacle points in the robot frame.
 
@@ -23,7 +30,7 @@ def scan_to_pcd(scan_data):
 
 	# nothing in view: a single far sentinel that can't be the min or violate safe_dist.
 	if pts.shape[0] == 0:
-		return np.full((L_max_lidar, 2), 1e10)
+		return np.full((L_max_lidar, 2), FAR_SENTINEL)
 
 	# more hits than the cap: keep the L_max_lidar nearest (argpartition is O(M)).
 	if pts.shape[0] > L_max_lidar:
@@ -32,10 +39,10 @@ def scan_to_pcd(scan_data):
 
 	# fewer hits than the cap: pad with a far sentinel (not a duplicate of a real
 	# point) to reach the fixed length. The cost aggregates points with a soft-min,
-	# where duplicating a near point would bias the estimate toward it; a 1e10
-	# sentinel is ignored by both the soft-min and the min-clearance metric.
+	# where duplicating a near point would bias the estimate toward it; a FAR_SENTINEL
+	# point is ignored by both the soft-min and the min-clearance metric.
 	if pts.shape[0] < L_max_lidar:
-		pad = np.full((L_max_lidar - pts.shape[0], 2), 1e10)
+		pad = np.full((L_max_lidar - pts.shape[0], 2), FAR_SENTINEL)
 		pts = np.vstack([pts, pad])
 
 	return pts
