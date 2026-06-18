@@ -1,5 +1,12 @@
 #!/usr/bin/env python3.10
 
+# Must be set BEFORE jax is imported. By default XLA grabs ~75% of GPU VRAM up front,
+# so several kernels (e.g. a notebook plus a benchmark) collide with CUDA_OUT_OF_MEMORY.
+# Disable preallocation and cap this process at 40% so multiple runs can share the GPU.
+import os
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -12,7 +19,7 @@ from functools import partial
 # (it sets array shapes used inside jit). Everything else is configurable
 # per-instance in Planner.__init__.
 # ------------------------------------------------------------------
-H = 30  # planning horizon (number of control steps)
+H = 40  # planning horizon (number of control steps)
 
 
 # ---------------------------- Dynamics ----------------------------
@@ -52,6 +59,20 @@ rollout_batch = jit(vmap(rollout, in_axes=(0, None, None, None, None)))
 
 
 # ------------------------------ Cost ------------------------------
+def soft_nearest(pos, pcd, lse_tau):
+	"""Density-robust nearest-obstacle distance per waypoint, shape (H+1,).
+
+	Softmax-weighted average of the lidar-point distances (weights ~ exp(-dist/tau)):
+	a smooth, count-invariant approximation of the distance to the *nearest* obstacle.
+	See obstacle_cost for why a soft-min (not a sum) is used. Factored out so the
+	clearance-adaptive speed term can reuse the exact same distance estimate.
+	"""
+	diffs = pos[:, None, :] - pcd[None, :, :]      # (H+1, N, 2)
+	dists = jnp.linalg.norm(diffs, axis=-1)         # (H+1, N)
+	w_near = nn.softmax(-dists / lse_tau, axis=1)   # (H+1, N) density-robust weights
+	return jnp.sum(w_near * dists, axis=1)          # (H+1,) ~ nearest obstacle distance
+
+
 def obstacle_cost(pos, pcd, cfg):
 	"""Obstacle penalty for a (H+1, 2) position trajectory.
 
@@ -77,10 +98,7 @@ def obstacle_cost(pos, pcd, cfg):
 	Split out from cost_fn so its gradient w.r.t. position can be drawn on the
 	animation as the repulsive force the plan feels (see obstacle_force).
 	"""
-	diffs = pos[:, None, :] - pcd[None, :, :]      # (H+1, N, 2)
-	dists = jnp.linalg.norm(diffs, axis=-1)         # (H+1, N)
-	w_near = nn.softmax(-dists / cfg['lse_tau'], axis=1)   # (H+1, N) density-robust weights
-	d_near = jnp.sum(w_near * dists, axis=1)              # (H+1,) ~ nearest obstacle distance
+	d_near = soft_nearest(pos, pcd, cfg['lse_tau'])      # (H+1,) ~ nearest obstacle distance
 	pen = cfg['safe_dist'] - d_near                                   # >0 inside the unsafe zone
 	wall = jnp.maximum(jnp.exp(jnp.maximum(pen, 0.0) / cfg['rep_scale']) - 1.0, 0.0)
 	far = jnp.maximum(cfg['safe_dist'] + cfg['d_far'] - d_near, 0.0)
@@ -109,7 +127,25 @@ def cost_fn(u_seq, goal, pcd, dt, cfg):
 	u_term = u_seq.reshape((H, 2))[-1]
 	cost_vterm = cfg['w_vterm'] * jnp.sum(u_term ** 2)
 
-	return cost_goal + cost_term + cost_obs + cost_ctrl + cost_vterm
+	# clearance-adaptive speed: penalize commanded speed in proportion to how close
+	# the path is to an obstacle, so the plan approaches clutter slowly and has time
+	# to turn out instead of clipping a corner at full v_max. prox is ~1 inside
+	# slow_radius and ->0 beyond it; waypoint i+1 is the one the control u_i drives to.
+	u_mat = u_seq.reshape((H, 2))
+	v_cmd = u_mat[:, 0]
+	d_near = soft_nearest(pos, pcd, cfg['lse_tau'])               # (H+1,)
+	prox = nn.sigmoid((cfg['slow_radius'] - d_near[1:]) / cfg['slow_width'])  # (H,)
+	cost_speed = cfg['w_slow'] * jnp.sum(prox * v_cmd ** 2)
+
+	# forward-preference: an asymmetric penalty on reverse motion (v < 0). The cost is
+	# otherwise position-only and sign-symmetric, so "drive forward at the goal" and
+	# "drive backward away from it" are equal-cost -- which lets the optimizer (esp.
+	# CEM/hybrid, which sample reverse rollouts freely) flip the robot around and back
+	# it through clutter into a collision. relu(-v)^2 makes forward the default while
+	# still allowing reverse when it is clearly the cheaper option.
+	cost_rev = cfg['w_rev'] * jnp.sum(jnp.maximum(-v_cmd, 0.0) ** 2)
+
+	return cost_goal + cost_term + cost_obs + cost_ctrl + cost_vterm + cost_speed + cost_rev
 
 
 cost_batch = vmap(cost_fn, in_axes=(0, None, None, None, None))
@@ -125,6 +161,85 @@ def obstacle_force(pos, pcd, cfg):
 	as a point with little or no outward arrow.
 	"""
 	return -grad(obstacle_cost)(pos, pcd, cfg)
+
+
+# ----------------------------- Carrot -----------------------------
+def free_distance(pcd, bearings, half_width, max_range):
+	"""How far the robot can travel along each bearing before a lidar point blocks
+	a corridor of half-width `half_width`. NumPy, robot frame. Returns (K,).
+
+	A point blocks bearing phi if it is ahead (positive along-ray projection) and
+	within half_width laterally of the ray. The blocked distance is its projection;
+	free distance is the nearest such block, capped at max_range. FAR_SENTINEL pad
+	points sit at ~1e3 laterally, so they never block.
+	"""
+	dirs = np.stack([np.cos(bearings), np.sin(bearings)], axis=1)   # (K, 2)
+	nrm = np.stack([-np.sin(bearings), np.cos(bearings)], axis=1)   # (K, 2) lateral
+	proj = pcd @ dirs.T                       # (N, K) along-ray distance
+	perp = np.abs(pcd @ nrm.T)                # (N, K) lateral offset
+	blocking = (proj > 0.0) & (perp < half_width)
+	blocked = np.where(blocking, proj, np.inf)
+	return np.minimum(blocked.min(axis=0), max_range)              # (K,)
+
+
+def _escape_bearing(pcd, half_width, look, goal_bear, cfg):
+	"""Freest direction over the full circle, with a mild goal-ward tiebreak, for
+	routing out of a pocket. Returns (bearing, free_distance)."""
+	ang = np.linspace(-np.pi, np.pi, int(cfg['carrot_n_escape']), endpoint=False)
+	f2 = free_distance(pcd, ang, half_width, look)
+	# wrap angular distance to [-pi, pi] so the tiebreak prefers the gap nearest the
+	# goal among similarly open ones, rather than always bolting back down the corridor.
+	dgoal = np.abs((ang - goal_bear + np.pi) % (2 * np.pi) - np.pi)
+	j = int(np.argmax(f2 - cfg['escape_bias'] * dgoal))
+	return ang[j], f2[j]
+
+
+def compute_carrot(goal_local, pcd, cfg, force_escape=False):
+	"""Pick a near-term target (carrot) instead of pulling straight at the goal.
+
+	A purely local planner that aims at the true goal drives head-on into whatever
+	cluster sits on the straight line to it. Within a cone around the goal bearing we
+	commit to the direction CLOSEST to the goal bearing that still has a viable free
+	corridor (>= carrot_min_free). This makes goal progress the priority and only
+	deviates as much as the obstacles force -- unlike maximizing free distance, which
+	lured the robot into whatever open space was widest (sideways into dead-ends and
+	oscillation). When no goal-ward direction is viable -- or the caller forces it via
+	force_escape because the robot has stopped making progress -- we search a full
+	circle for the freest way out (it may point back the way it came, so the caller
+	switches to the reverse-allowing config).
+	Inside carrot_lookahead the carrot IS the goal, so the final approach and stop are
+	unchanged. Returns (carrot (2,) float32 in the robot frame, escape bool).
+	"""
+	goal_local = np.asarray(goal_local, dtype=np.float32)
+	gx, gy = float(goal_local[0]), float(goal_local[1])
+	goal_dist = float(np.hypot(gx, gy))
+	look = cfg['carrot_lookahead']
+	if goal_dist <= look and not force_escape:
+		return goal_local, False                # final approach: aim at the real goal
+
+	goal_bear = np.arctan2(gy, gx)
+	half_width = cfg['safe_dist'] + cfg['carrot_clear']
+
+	# goal-ward cone: the viable bearing nearest the goal bearing.
+	cone = cfg['carrot_cone']
+	bearings = goal_bear + np.linspace(-cone, cone, int(cfg['carrot_n']))
+	free = free_distance(pcd, bearings, half_width, look)
+	viable = free >= cfg['carrot_min_free']
+	if viable.any() and not force_escape:
+		dev = np.where(viable, np.abs(bearings - goal_bear), np.inf)
+		k = int(np.argmin(dev))
+		best, best_free, escape = bearings[k], free[k], False
+	else:
+		# boxed in (geometrically, or forced because no progress): route out.
+		best, best_free = _escape_bearing(pcd, half_width, look, goal_bear, cfg)
+		escape = True
+
+	# never aim the carrot past the blocking obstacle: cap reach at the free run (less
+	# a margin) so the plan is pulled to open space, not into a wall. carrot_floor is
+	# only a lower bound for keeping the pull alive, applied after that cap.
+	reach = min(look, best_free - cfg['carrot_margin'])
+	reach = float(np.clip(reach, min(cfg['carrot_floor'], best_free), look))
+	return np.array([reach * np.cos(best), reach * np.sin(best)], dtype=np.float32), escape
 
 
 # --------------------------- Optimizers ---------------------------
@@ -254,7 +369,7 @@ class Planner():
 			'v_max': 2.0,
 			'w_max': 2.0,
 			# obstacles: each pcd point is a small circle of radius r_obs
-			'safe_dist': 0.0 + 0.3 + 0.05,   # r_obs + r_robot + margin
+			'safe_dist': 0.0 + 0.3 + 0.05,   # r_obs + r_robot + margin (see test.py)
 			# cost weights
 			'w_term': 500.0,
 			'w_goal_run': 500.0,
@@ -268,11 +383,34 @@ class Planner():
 			# values below are the mean of the configs that passed the barn_43
 			# full-factorial grid (gd+nesterov): the centroid of what worked.
 			'w_obs': 1e5,
-			'rep_scale': 0.13,
-			'w_far': 100.0,
-			'd_far': 0.20,
+			# steeper wall (was 0.13): a shorter exp decay length makes repulsion rise
+			# faster as the path penetrates the safe zone, so the obstacle gradient
+			# dominates its *direction* (pure push-out) at moderate proximity instead of
+			# balancing goal-pull into a tangent that skims the corner. This is the main
+			# lever against the gradient methods' corner-clipping.
+			'rep_scale': 0.10,
+			# wider, firmer gentle far field (was w_far=100, d_far=0.20): reaches
+			# further beyond the safe edge so the plan keeps clearance and centres in
+			# corridors where there is room, while still yielding in a tight gap.
+			'w_far': 150.0,
+			'd_far': 0.35,
 			'lse_tau': 0.1,
 			'w_ctrl': 0.02,
+			# clearance-adaptive speed: penalize commanded speed v^2 weighted by how
+			# close the path is to an obstacle, so the plan slows into clutter instead
+			# of clipping corners at v_max. slow_radius is where slowing kicks in (m,
+			# measured as nearest-obstacle distance), slow_width the blend softness.
+			'w_slow': 14.0,
+			'slow_radius': 0.62,
+			'slow_width': 0.12,
+			# forward-preference: asymmetric penalty on reverse motion (v<0), so the
+			# planner stops flipping the robot around and backing through clutter. See
+			# cost_fn. Large enough to make forward the default, not so large it forbids
+			# a genuinely useful reverse. Kept firm here to stop the gratuitous goal-flip
+			# (CEM facing the robot backwards near the goal); backing out of a pocket is
+			# handled separately by the escape config (w_rev=0), switched in only when
+			# the carrot reports the robot is boxed in.
+			'w_rev': 40.0,
 			# terminal-velocity penalty: brings the plan to rest at the goal so the
 			# robot stops instead of orbiting. Larger -> brakes harder/earlier.
 			'w_vterm': 10.0,
@@ -308,6 +446,32 @@ class Planner():
 			'sigma_init': 1.0,
 			'sigma_min': 0.05,
 			'alpha': 0.1,
+			# carrot / sub-goal (see compute_carrot): aim the cost at a near, free,
+			# goal-ward point instead of straight at the goal, so the plan stops
+			# driving head-on into clusters. Inside carrot_lookahead the carrot is the
+			# real goal (final approach unchanged).
+			'use_carrot': 1.0,
+			'carrot_lookahead': 3.5,   # m; also the cap on how far the carrot is placed
+			'carrot_cone': 1.2,        # rad; search +/- this around the goal bearing
+			'carrot_n': 41.0,          # candidate bearings in the cone
+			# corridor half-width for picking the carrot bearing = safe_dist +
+			# carrot_clear. Negative pulls it in toward the robot radius so genuinely
+			# passable BARN gaps still register as free directions (the per-step
+			# obstacle cost, not the carrot, enforces the real body clearance).
+			'carrot_clear': -0.15,
+			'carrot_min_free': 0.7,    # m; a bearing is "viable" if it has this much
+			                           # free corridor. Commit to the viable bearing
+			                           # nearest the goal; below this, treat as blocked.
+			'carrot_n_escape': 72.0,   # full-circle bearings for the pocket-escape search
+			'escape_bias': 0.2,        # mild goal-ward tiebreak among open escape gaps
+			# progress-based stuck detector (see compute_controls):
+			'stuck_eps': 0.05,         # m of goal-distance gain that counts as progress
+			'stuck_patience': 15.0,    # steps without progress before forcing escape
+			'escape_hold': 20.0,       # steps to stay in escape once triggered
+			'carrot_margin': 0.3,      # stop the carrot short of the blocking point (m)
+			'carrot_floor': 0.4,       # min carrot reach (m): keep a little goal pull
+			                           # alive when the free run is short, but never
+			                           # beyond the obstacle (capped at best_free)
 		}
 		if cfg is not None:
 			self.cfg.update(cfg)
@@ -323,6 +487,11 @@ class Planner():
 
 		# frozen tuple makes cfg hashable -> usable as a static jit arg
 		self._cfg_static = _FrozenCfg(self.cfg)
+		# escape config: identical but with the reverse penalty off, used only when the
+		# carrot reports the robot is boxed in, so it can back out of a pocket. Both
+		# configs are hashable static jit args, so JAX caches a compiled variant of each
+		# and toggling between them per step costs nothing after the first compile.
+		self._cfg_escape = _FrozenCfg({**self.cfg, 'w_rev': 0.0})
 
 		# warm start: small forward velocity bias + tiny asymmetric noise.
 		# The noise breaks the left/right symmetry that otherwise deadlocks plain
@@ -334,10 +503,47 @@ class Planner():
 		u0 = u0 + 0.01 * normal(PRNGKey(42), (H, 2))
 		self.u_seq = u0.reshape(-1)
 
+		# progress-based stuck detector state (see compute_controls).
+		self._best_goal_dist = float('inf')
+		self._stuck_count = 0
+		self._escape_hold = 0
+
 	def compute_controls(self, initial_velocity, goal_local, pcd):
-		goal = jnp.asarray(goal_local, dtype=jnp.float32)
-		pcd = jnp.asarray(pcd, dtype=jnp.float32)
+		# carrot: aim at a near, collision-free, goal-ward point instead of straight at
+		# the goal (computed in NumPy from the robot-frame pcd before it goes to JAX).
 		cfg = self._cfg_static
+		if self.cfg['use_carrot']:
+			# progress-based stuck detector: a robot can sit in a pocket that still has a
+			# geometrically "viable" sideways gap, so geometry alone won't flag it. Track
+			# the best (smallest) goal distance reached; if it hasn't improved for
+			# stuck_patience steps, force escape for a held burst of steps so the robot
+			# actually routes out (reverse allowed) before re-evaluating.
+			goal_dist = float(np.hypot(float(goal_local[0]), float(goal_local[1])))
+			if goal_dist < self._best_goal_dist - self.cfg['stuck_eps']:
+				self._best_goal_dist = goal_dist
+				self._stuck_count = 0
+			else:
+				self._stuck_count += 1
+
+			force_escape = False
+			if self._escape_hold > 0:
+				self._escape_hold -= 1
+				force_escape = True
+			elif self._stuck_count >= self.cfg['stuck_patience']:
+				force_escape = True
+				self._escape_hold = int(self.cfg['escape_hold'])
+				self._stuck_count = 0
+				self._best_goal_dist = goal_dist   # require fresh progress after escaping
+
+			target, escape = compute_carrot(goal_local, np.asarray(pcd), self.cfg, force_escape)
+			# boxed in: switch to the escape config (reverse allowed) so the robot can
+			# back out of a pocket instead of freezing against the forward-preference.
+			if escape:
+				cfg = self._cfg_escape
+		else:
+			target = goal_local
+		goal = jnp.asarray(target, dtype=jnp.float32)
+		pcd = jnp.asarray(pcd, dtype=jnp.float32)
 
 		if self.planner_type == "gd":
 			u_opt = optimize_gd(self.u_seq, goal, pcd, self.dt, cfg)

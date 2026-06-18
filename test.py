@@ -135,7 +135,11 @@ def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
 		'v_min': float(vel_min[0]),
 		'v_max': float(vel_max[0]),
 		'w_max': float(max(abs(vel_min[1]), abs(vel_max[1]))),
-		'safe_dist': robot_radius + 0.1 + 0.1,  # r_robot + pcd point radius + margin
+		# r_robot + pcd point radius + margin. Small margin (0.05): a larger one inflates
+		# obstacles enough to close genuinely passable BARN gaps and stall the robot.
+		# Corner-clipping is held off instead by the steeper wall (rep_scale) and the
+		# clearance-adaptive speed term, not by a fat safety margin.
+		'safe_dist': robot_radius + 0.1 + 0.05,
 	}
 	if cfg_override:
 		env_cfg.update(cfg_override)
@@ -191,14 +195,14 @@ def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
 				quiver_artist.remove()
 				quiver_artist = None
 			mmax = float(np.linalg.norm(force_global, axis=1).max())
-			if mmax > 1e-6:
-				# scale so the strongest arrow this frame is ~0.6 m: magnitudes span
-				# orders of magnitude, so arrows are relative within each frame.
-				quiver_artist = ax.quiver(
-					traj_global[:, 0], traj_global[:, 1],
-					force_global[:, 0], force_global[:, 1],
-					color='lime', angles='xy', scale_units='xy',
-					scale=mmax / 0.6, width=0.004, zorder=5)
+			# if mmax > 1e-6:
+			# 	# scale so the strongest arrow this frame is ~0.6 m: magnitudes span
+			# 	# orders of magnitude, so arrows are relative within each frame.
+			# 	quiver_artist = ax.quiver(
+			# 		traj_global[:, 0], traj_global[:, 1],
+			# 		force_global[:, 0], force_global[:, 1],
+			# 		color='lime', angles='xy', scale_units='xy',
+			# 		scale=mmax / 0.6, width=0.004, zorder=5)
 
 		env.step(velocity)
 		if render:
