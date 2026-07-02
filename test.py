@@ -105,7 +105,7 @@ def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
 
 	render=False, save_ani=False disables all plotting for fast benchmarking.
 	ani_dst=(dir, name) sends a saved gif there instead of animation/<world>/.
-	cfg_override: dict merged into the planner config (e.g. {'rep_scale': 0.06}),
+	cfg_override: dict merged into the planner config (e.g. {'w_obs': 500.0}),
 	used by the hyperparameter sweep.
 	horizon: if set, overrides the planning horizon H for this episode. H is a
 	module global that sets array shapes, so this sets planner.H before building the
@@ -121,7 +121,6 @@ def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
 		_hide_obstacle_arrows(env)
 		ax = env._env_plot.ax
 		traj_line = None
-		quiver_artist = None
 	else:
 		env = irsim.make(world, save_ani=save_ani, display=False, disable_all_plot=True)
 		_fix_paths(env)
@@ -135,11 +134,11 @@ def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
 		'v_min': float(vel_min[0]),
 		'v_max': float(vel_max[0]),
 		'w_max': float(max(abs(vel_min[1]), abs(vel_max[1]))),
-		# r_robot + pcd point radius + margin. Small margin (0.05): a larger one inflates
-		# obstacles enough to close genuinely passable BARN gaps and stall the robot.
-		# Corner-clipping is held off instead by the steeper wall (rep_scale) and the
-		# clearance-adaptive speed term, not by a fat safety margin.
-		'safe_dist': robot_radius + 0.1 + 0.05,
+		# Lidar ranges hit the obstacle surface, so pcd points lie ON the boundary:
+		# the hard floor is just robot radius + a small margin. A larger margin
+		# inflates obstacles enough to close genuinely passable BARN gaps; the soft
+		# buffer (d_buffer) in the obstacle cost supplies comfort clearance beyond it.
+		'safe_dist': robot_radius + 0.05,
 	}
 	if cfg_override:
 		env_cfg.update(cfg_override)
@@ -181,28 +180,6 @@ def run_episode(world="obstacle_world.yaml", planner_type="hybrid",
 			if traj_line is not None:
 				traj_line.remove()
 			traj_line, = ax.plot(traj_global[:, 0], traj_global[:, 1], 'b-')
-
-			# obstacle-cost gradient (repulsive force) at each trajectory point, so the
-			# gif shows where the plan is being pushed off obstacles -- and where it
-			# isn't, which is where it clips corners. The force is in the robot frame;
-			# rotate it by yaw into world coords (a direction, so no translation).
-			force_local = planner.obstacle_force(optimal_traj, pcd)
-			yaw = robot_state[2]
-			R = np.array([[np.cos(yaw), -np.sin(yaw)],
-						  [np.sin(yaw),  np.cos(yaw)]])
-			force_global = (R @ force_local.T).T
-			if quiver_artist is not None:
-				quiver_artist.remove()
-				quiver_artist = None
-			mmax = float(np.linalg.norm(force_global, axis=1).max())
-			# if mmax > 1e-6:
-			# 	# scale so the strongest arrow this frame is ~0.6 m: magnitudes span
-			# 	# orders of magnitude, so arrows are relative within each frame.
-			# 	quiver_artist = ax.quiver(
-			# 		traj_global[:, 0], traj_global[:, 1],
-			# 		force_global[:, 0], force_global[:, 1],
-			# 		color='lime', angles='xy', scale_units='xy',
-			# 		scale=mmax / 0.6, width=0.004, zorder=5)
 
 		env.step(velocity)
 		if render:
@@ -363,7 +340,7 @@ def benchmark(worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_steps=30
 
 
 def _cfg_label(cfg):
-	"""Short, stable label for a sweep config dict, e.g. H50_rep_scale0.08_w_far200."""
+	"""Short, stable label for a sweep config dict, e.g. H50_lr0.01_w_obs500."""
 	parts = [f"H{cfg.get('horizon', _planner.H)}"]
 	for k in sorted(cfg):
 		if k != 'horizon':
@@ -376,7 +353,7 @@ def sweep(configs, worlds, planners=("gd", "nesterov", "cem", "hybrid"), max_ste
 	"""Cross-eval a list of configs over worlds x planners.
 
 	Each config is a dict that may contain 'horizon' (sets the planning horizon H)
-	plus any planner cfg key to override (e.g. rep_scale, grad_clip, lr):
+	plus any planner cfg key to override (e.g. w_obs, grad_clip, lr):
 		configs = [
 			{'horizon': 30, 'lr': 0.005, 'grad_clip': 250},
 			{'horizon': 30, 'lr': 0.01,  'grad_clip': 1000},
