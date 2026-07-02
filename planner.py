@@ -250,8 +250,11 @@ class Planner:
 			# obstacle geometry: lidar points lie ON obstacle surfaces, so safe_dist
 			# is robot radius + a small margin (test.py overrides per world);
 			# d_buffer is the soft comfort zone beyond it where the hinge cost ramps.
+			# Keep safe_dist + d_buffer under half the narrowest passable gap
+			# (~0.8 m in BARN): a wider buffer puts nonzero cost across the whole
+			# gap and its gradient walls gradient descent out at the entrance.
 			'safe_dist': 0.2 + 0.05,
-			'd_buffer': 0.25,
+			'd_buffer': 0.10,
 			'lse_tau': 0.1,
 			# cost weights. w_obs is sized so the wall dominates the goal pull near
 			# contact (obstacle gradient tops out at ~2*w_obs*(safe_dist+d_buffer),
