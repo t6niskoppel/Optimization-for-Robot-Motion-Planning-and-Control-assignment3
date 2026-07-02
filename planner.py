@@ -66,7 +66,9 @@ def cost_fn(u_seq, goal, pcd, dt, cfg):
 
 	# obstacles: quadratic hinge on the nearest-obstacle distance -- zero beyond
 	# safe_dist + d_buffer, growing as the path closes in. Its gradient is bounded
-	# (unlike an exp wall's), so descent steps stay sane near contact.
+	# (unlike an exp wall's), so descent steps stay sane near contact. Any gap
+	# narrower than 2*(safe_dist + d_buffer) is effectively walled off; the carrot
+	# uses the same width as its corridor test so it never proposes such a gap.
 	d_near = soft_nearest(pos, pcd, cfg['lse_tau'])
 	pen = jnp.maximum(cfg['safe_dist'] + cfg['d_buffer'] - d_near, 0.0)
 	cost_obs = cfg['w_obs'] * jnp.sum(pen ** 2)
@@ -102,7 +104,7 @@ def free_distance(pcd, bearings, half_width, max_range):
 	return np.minimum(blocked.min(axis=0), max_range)              # (K,)
 
 
-def compute_carrot(goal_local, pcd, cfg):
+def compute_carrot(goal_local, pcd, cfg, escaping=False):
 	"""Pick a near-term target (carrot) instead of pulling straight at the goal.
 
 	A purely local planner that aims at the true goal drives head-on into whatever
@@ -110,23 +112,34 @@ def compute_carrot(goal_local, pcd, cfg):
 	we commit to the direction CLOSEST to the goal bearing that still has a viable
 	free corridor (>= carrot_min_free); when none is viable, search the full circle
 	for the freest way out. Inside carrot_lookahead the carrot IS the goal, so the
-	final approach is unchanged. Returns a (2,) float32 target in the robot frame.
+	final approach is unchanged.
+
+	`escaping` is last step's mode: once in escape, a gap must show extra free
+	margin before being trusted again. Without the hysteresis a borderline gap
+	flips the target between "through the gap" and "escape" every step, and the
+	thrashing plan spins the robot into the gap sides.
+	Returns (target (2,) float32 in the robot frame, escaping bool).
 	"""
 	goal_local = np.asarray(goal_local, dtype=np.float32)
 	goal_dist = float(np.hypot(goal_local[0], goal_local[1]))
 	look = cfg['carrot_lookahead']
 	if goal_dist <= look:
-		return goal_local               # final approach: aim at the real goal
+		return goal_local, False        # final approach: aim at the real goal
 
 	goal_bear = float(np.arctan2(goal_local[1], goal_local[0]))
-	half_width = cfg['safe_dist']
+	# corridor width matches the cost wall: a gap the obstacle cost would wall the
+	# optimizer out of (< 2*(safe_dist+d_buffer)) must never be proposed as viable,
+	# or the robot deadlocks at its entrance -- carrot pulling in, cost pushing out.
+	half_width = cfg['safe_dist'] + cfg['d_buffer']
+	min_free = cfg['carrot_min_free'] + (0.3 if escaping else 0.0)
 
 	# goal-ward cone: the viable bearing nearest the goal bearing.
 	bearings = goal_bear + np.linspace(-cfg['carrot_cone'], cfg['carrot_cone'], 41)
 	free = free_distance(pcd, bearings, half_width, look)
-	viable = free >= cfg['carrot_min_free']
+	viable = free >= min_free
 	if viable.any():
 		k = int(np.argmin(np.where(viable, np.abs(bearings - goal_bear), np.inf)))
+		escaping = False
 	else:
 		# boxed in: full-circle search for the freest way out, with a mild goal-ward
 		# tiebreak so it doesn't always bolt straight back down the corridor.
@@ -134,12 +147,13 @@ def compute_carrot(goal_local, pcd, cfg):
 		free = free_distance(pcd, bearings, half_width, look)
 		dgoal = np.abs((bearings - goal_bear + np.pi) % (2 * np.pi) - np.pi)
 		k = int(np.argmax(free - 0.2 * dgoal))
+		escaping = True
 
 	# aim short of the blocking obstacle so the plan is pulled to open space, not
 	# into a wall -- but keep at least a little pull alive when the free run is short.
 	reach = float(np.clip(free[k] - cfg['safe_dist'], min(0.5, float(free[k])), look))
-	return np.array([reach * np.cos(bearings[k]), reach * np.sin(bearings[k])],
-					dtype=np.float32)
+	return (np.array([reach * np.cos(bearings[k]), reach * np.sin(bearings[k])],
+					dtype=np.float32), escaping)
 
 
 # --------------------------- Optimizers ---------------------------
@@ -248,20 +262,20 @@ class Planner:
 			'v_max': 2.0,
 			'w_max': 2.0,
 			# obstacle geometry: lidar points lie ON obstacle surfaces, so safe_dist
-			# is robot radius + a small margin (test.py overrides per world);
-			# d_buffer is the soft comfort zone beyond it where the hinge cost ramps.
-			# Keep safe_dist + d_buffer under half the narrowest passable gap
-			# (~0.8 m in BARN): a wider buffer puts nonzero cost across the whole
-			# gap and its gradient walls gradient descent out at the entrance.
+			# is robot radius + a small margin (test.py overrides per world).
+			# d_buffer is the soft zone beyond it where the hinge cost ramps; keep
+			# safe_dist + d_buffer under half the narrowest gap the robot must take
+			# (~0.75 m in BARN), since wider gets walled off (and routed around by
+			# the carrot, whose corridor test uses the same width).
 			'safe_dist': 0.2 + 0.05,
 			'd_buffer': 0.10,
 			'lse_tau': 0.1,
-			# cost weights. w_obs is sized so the wall dominates the goal pull near
-			# contact (obstacle gradient tops out at ~2*w_obs*(safe_dist+d_buffer),
-			# goal gradient per waypoint is ~2*w_goal_run*dist).
+			# cost weights. w_obs is sized so the wall dominates the goal pull well
+			# before contact: even a shallow graze (pen ~ 0.05) must cost more than
+			# the goal-progress it buys, or the optimizers shave through corners.
 			'w_goal_run': 1.0,
 			'w_term': 20.0,
-			'w_obs': 2000.0,
+			'w_obs': 6000.0,
 			'w_ctrl': 0.01,
 			'w_rev': 1.0,
 			# gradient descent / nesterov (nesterov rescales lr by 1-momentum, so
@@ -300,9 +314,12 @@ class Planner:
 		u0 = u0 + 0.01 * normal(PRNGKey(42), (H, 2))
 		self.u_seq = u0.reshape(-1)
 
+		self._escaping = False  # carrot mode hysteresis, see compute_carrot
+
 	def compute_controls(self, initial_velocity, goal_local, pcd):
 		cfg = self._cfg_static
-		target = compute_carrot(goal_local, np.asarray(pcd), self.cfg)
+		target, self._escaping = compute_carrot(
+			goal_local, np.asarray(pcd), self.cfg, self._escaping)
 		goal = jnp.asarray(target, dtype=jnp.float32)
 		pcd = jnp.asarray(pcd, dtype=jnp.float32)
 
