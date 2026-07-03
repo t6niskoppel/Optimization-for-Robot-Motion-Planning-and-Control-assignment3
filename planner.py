@@ -66,9 +66,9 @@ def cost_fn(u_seq, goal, pcd, dt, cfg):
 
 	# obstacles: quadratic hinge on the nearest-obstacle distance -- zero beyond
 	# safe_dist + d_buffer, growing as the path closes in. Its gradient is bounded
-	# (unlike an exp wall's), so descent steps stay sane near contact. Any gap
-	# narrower than 2*(safe_dist + d_buffer) is effectively walled off; the carrot
-	# uses the same width as its corridor test so it never proposes such a gap.
+	# (unlike an exp wall's), so descent steps stay sane near contact. The hinge is
+	# soft: a gap narrower than 2*(safe_dist + d_buffer) costs to traverse but is
+	# not walled off, so tight-but-passable gaps stay reachable.
 	d_near = soft_nearest(pos, pcd, cfg['lse_tau'])
 	pen = jnp.maximum(cfg['safe_dist'] + cfg['d_buffer'] - d_near, 0.0)
 	cost_obs = cfg['w_obs'] * jnp.sum(pen ** 2)
@@ -85,75 +85,6 @@ def cost_fn(u_seq, goal, pcd, dt, cfg):
 
 
 cost_batch = vmap(cost_fn, in_axes=(0, None, None, None, None))
-
-
-# ----------------------------- Carrot -----------------------------
-def free_distance(pcd, bearings, half_width, max_range):
-	"""How far the robot can travel along each bearing before a lidar point blocks
-	a corridor of half-width `half_width`. NumPy, robot frame. Returns (K,).
-
-	A point blocks bearing phi if it is ahead (positive along-ray projection) and
-	within half_width laterally of the ray; the free distance is the nearest such
-	block, capped at max_range. FAR_SENTINEL pad points never block.
-	"""
-	dirs = np.stack([np.cos(bearings), np.sin(bearings)], axis=1)   # (K, 2)
-	nrm = np.stack([-np.sin(bearings), np.cos(bearings)], axis=1)   # (K, 2) lateral
-	proj = pcd @ dirs.T                       # (N, K) along-ray distance
-	perp = np.abs(pcd @ nrm.T)                # (N, K) lateral offset
-	blocked = np.where((proj > 0.0) & (perp < half_width), proj, np.inf)
-	return np.minimum(blocked.min(axis=0), max_range)              # (K,)
-
-
-def compute_carrot(goal_local, pcd, cfg, escaping=False):
-	"""Pick a near-term target (carrot) instead of pulling straight at the goal.
-
-	A purely local planner that aims at the true goal drives head-on into whatever
-	cluster sits on the straight line to it. Within a cone around the goal bearing
-	we commit to the direction CLOSEST to the goal bearing that still has a viable
-	free corridor (>= carrot_min_free); when none is viable, search the full circle
-	for the freest way out. Inside carrot_lookahead the carrot IS the goal, so the
-	final approach is unchanged.
-
-	`escaping` is last step's mode: once in escape, a gap must show extra free
-	margin before being trusted again. Without the hysteresis a borderline gap
-	flips the target between "through the gap" and "escape" every step, and the
-	thrashing plan spins the robot into the gap sides.
-	Returns (target (2,) float32 in the robot frame, escaping bool).
-	"""
-	goal_local = np.asarray(goal_local, dtype=np.float32)
-	goal_dist = float(np.hypot(goal_local[0], goal_local[1]))
-	look = cfg['carrot_lookahead']
-	if goal_dist <= look:
-		return goal_local, False        # final approach: aim at the real goal
-
-	goal_bear = float(np.arctan2(goal_local[1], goal_local[0]))
-	# corridor width matches the cost wall: a gap the obstacle cost would wall the
-	# optimizer out of (< 2*(safe_dist+d_buffer)) must never be proposed as viable,
-	# or the robot deadlocks at its entrance -- carrot pulling in, cost pushing out.
-	half_width = cfg['safe_dist'] + cfg['d_buffer']
-	min_free = cfg['carrot_min_free'] + (0.3 if escaping else 0.0)
-
-	# goal-ward cone: the viable bearing nearest the goal bearing.
-	bearings = goal_bear + np.linspace(-cfg['carrot_cone'], cfg['carrot_cone'], 41)
-	free = free_distance(pcd, bearings, half_width, look)
-	viable = free >= min_free
-	if viable.any():
-		k = int(np.argmin(np.where(viable, np.abs(bearings - goal_bear), np.inf)))
-		escaping = False
-	else:
-		# boxed in: full-circle search for the freest way out, with a mild goal-ward
-		# tiebreak so it doesn't always bolt straight back down the corridor.
-		bearings = np.linspace(-np.pi, np.pi, 72, endpoint=False)
-		free = free_distance(pcd, bearings, half_width, look)
-		dgoal = np.abs((bearings - goal_bear + np.pi) % (2 * np.pi) - np.pi)
-		k = int(np.argmax(free - 0.2 * dgoal))
-		escaping = True
-
-	# aim short of the blocking obstacle so the plan is pulled to open space, not
-	# into a wall -- but keep at least a little pull alive when the free run is short.
-	reach = float(np.clip(free[k] - cfg['safe_dist'], min(0.5, float(free[k])), look))
-	return (np.array([reach * np.cos(bearings[k]), reach * np.sin(bearings[k])],
-					dtype=np.float32), escaping)
 
 
 # --------------------------- Optimizers ---------------------------
@@ -263,10 +194,7 @@ class Planner:
 			'w_max': 2.0,
 			# obstacle geometry: lidar points lie ON obstacle surfaces, so safe_dist
 			# is robot radius + a small margin (test.py overrides per world).
-			# d_buffer is the soft zone beyond it where the hinge cost ramps; keep
-			# safe_dist + d_buffer under half the narrowest gap the robot must take
-			# (~0.75 m in BARN), since wider gets walled off (and routed around by
-			# the carrot, whose corridor test uses the same width).
+			# d_buffer is the soft comfort zone beyond it where the hinge cost ramps.
 			'safe_dist': 0.2 + 0.05,
 			'd_buffer': 0.10,
 			'lse_tau': 0.1,
@@ -294,10 +222,6 @@ class Planner:
 			'hybrid_cem_iters': 8,
 			'sigma_init': 1.0,
 			'sigma_min': 0.05,
-			# carrot / sub-goal (see compute_carrot)
-			'carrot_lookahead': 3.5,   # m; also caps how far the carrot is placed
-			'carrot_cone': 1.2,        # rad; search +/- this around the goal bearing
-			'carrot_min_free': 0.7,    # m; min free corridor for a viable bearing
 		}
 		if cfg is not None:
 			self.cfg.update(cfg)
@@ -314,13 +238,9 @@ class Planner:
 		u0 = u0 + 0.01 * normal(PRNGKey(42), (H, 2))
 		self.u_seq = u0.reshape(-1)
 
-		self._escaping = False  # carrot mode hysteresis, see compute_carrot
-
 	def compute_controls(self, initial_velocity, goal_local, pcd):
 		cfg = self._cfg_static
-		target, self._escaping = compute_carrot(
-			goal_local, np.asarray(pcd), self.cfg, self._escaping)
-		goal = jnp.asarray(target, dtype=jnp.float32)
+		goal = jnp.asarray(goal_local, dtype=jnp.float32)
 		pcd = jnp.asarray(pcd, dtype=jnp.float32)
 
 		if self.planner_type == "gd":
